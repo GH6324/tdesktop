@@ -7,12 +7,14 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+#include "base/const_string.h"
 #include "base/invoke_queued.h"
 #include "base/object_ptr.h"
 #include "base/unique_qptr.h"
 #include "iv/iv_delegate.h"
 #include "ui/effects/animations.h"
 #include "ui/text/text.h"
+#include "webview/webview_common.h"
 
 class Painter;
 
@@ -32,6 +34,8 @@ class FadeWrapScaled;
 } // namespace Ui
 
 namespace Iv {
+
+constexpr auto kTLViewerUrl = "https://tdesktop-x64.github.io/tlv/"_cs;
 
 struct Prepared;
 
@@ -62,6 +66,7 @@ public:
 			OpenLink,
 			OpenLinkExternal,
 			OpenMedia,
+			Report,
 		};
 		Type type = Type::Close;
 		QString url;
@@ -69,10 +74,15 @@ public:
 	};
 
 	void show(
-		const QString &dataPath,
+		const Webview::StorageId &storageId,
 		Prepared page,
 		base::flat_map<QByteArray, rpl::producer<bool>> inChannelValues);
 	void update(Prepared page);
+
+	[[nodiscard]] static bool IsGoodTonSiteUrl(const QString &uri);
+	void showTonSite(const Webview::StorageId &storageId, QString uri);
+
+	void showTLViewer(const Webview::StorageId& storageId, QString uri);
 
 	[[nodiscard]] bool active() const;
 	void showJoinedTooltip();
@@ -90,11 +100,11 @@ public:
 
 private:
 	void createWindow();
-	void createWebview(const QString &dataPath);
+	void createWebview(const Webview::StorageId &storageId);
 	[[nodiscard]] QByteArray navigateScript(int index, const QString &hash);
 	[[nodiscard]] QByteArray reloadScript(int index);
 
-	void showInWindow(const QString &dataPath, Prepared page);
+	void showInWindow(const Webview::StorageId &storageId, Prepared page);
 	[[nodiscard]] QByteArray fillInChannelValuesScript(
 		base::flat_map<QByteArray, rpl::producer<bool>> inChannelValues);
 	[[nodiscard]] QByteArray toggleInChannelScript(
@@ -115,18 +125,26 @@ private:
 	void quit();
 
 	[[nodiscard]] QString composeCurrentUrl() const;
+	[[nodiscard]] uint64 compuseCurrentPageId() const;
 	void showShareMenu();
 	void destroyShareMenu();
+
+	void showWebviewError();
+	void showWebviewError(TextWithEntities text);
 
 	const not_null<Delegate*> _delegate;
 
 	std::unique_ptr<Ui::RpWindow> _window;
 	std::unique_ptr<Ui::RpWidget> _subtitleWrap;
+	rpl::variable<QString> _url;
 	rpl::variable<QString> _subtitleText;
+	rpl::variable<QString> _windowTitleText;
 	std::unique_ptr<Ui::FlatLabel> _subtitle;
-	Ui::Animations::Simple _subtitleLeft;
+	Ui::Animations::Simple _subtitleBackShift;
+	Ui::Animations::Simple _subtitleForwardShift;
 	object_ptr<Ui::IconButton> _menuToggle = { nullptr };
 	object_ptr<Ui::FadeWrapScaled<Ui::IconButton>> _back = { nullptr };
+	object_ptr<Ui::FadeWrapScaled<Ui::IconButton>> _forward = { nullptr };
 	base::unique_qptr<Ui::PopupMenu> _menu;
 	Ui::RpWidget *_container = nullptr;
 	std::unique_ptr<Webview::Window> _webview;

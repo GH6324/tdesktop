@@ -27,10 +27,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/rect.h"
 #include "ui/widgets/popup_menu.h"
 #include "ui/widgets/tooltip.h"
+#include "ui/wrap/slide_wrap.h"
+#include "ui/ui_utility.h"
 #include "window/window_controller.h"
 #include "window/window_session_controller.h"
-#include "styles/style_chat.h" // popupMenuExpandedSeparator
-#include "styles/style_info.h" // infoTopBarMenu
+#include "styles/style_chat.h"
+#include "styles/style_info.h"
 #include "styles/style_menu_icons.h"
 #include "styles/style_window.h"
 
@@ -163,41 +165,42 @@ not_null<Ui::SettingsButton*> AddMyChannelsBox(
 		st->photoSize = st::defaultPeerListItem.photoSize;
 		st->size = QSize(st->photoSize, st->photoSize);
 
-		class Button final : public Ui::SettingsButton {
-		public:
-			using Ui::SettingsButton::SettingsButton;
-
-			void setPeer(not_null<PeerData*> p) {
-				const auto c = p->asChannel();
-				const auto g = p->asChat();
-				_text.setText(
-					st::defaultPeerListItem.nameStyle,
-					((c && c->isMegagroup()) ? u"[s] "_q : QString())
-						+ p->name());
-				const auto count = c ? c->membersCount() : g->count;
-				_status.setText(
-					st::defaultTextStyle,
-					!p->username().isEmpty()
-						? ('@' + p->username())
-						: (count > 0)
-						? ((c && !c->isMegagroup())
-							? tr::lng_chat_status_subscribers
-							: tr::lng_chat_status_members)(
-								tr::now,
-								lt_count,
-								count)
-						: QString());
-			}
-
-			int resizeGetHeight(int) override {
-				return st::defaultPeerListItem.height;
-			}
-
-			void paintEvent(QPaintEvent *e) override {
-				Ui::SettingsButton::paintEvent(e);
-				auto p = Painter(this);
+		const auto megagroupMark = u"[s] "_q;
+		const auto add = [&](
+				not_null<PeerData*> peer,
+				not_null<Ui::VerticalLayout*> container) {
+			const auto row = container->add(
+				object_ptr<Ui::AbstractButton>::fromRaw(
+					Ui::CreateSimpleSettingsButton(
+						container,
+						st::defaultRippleAnimation,
+						st::defaultSettingsButton.textBgOver)));
+			row->resize(row->width(), st::defaultPeerListItem.height);
+			const auto c = peer->asChannel();
+			const auto g = peer->asChat();
+			const auto count = c ? c->membersCount() : g->count;
+			const auto text = std::make_shared<Ui::Text::String>(
+				st::defaultPeerListItem.nameStyle,
+				((c && c->isMegagroup()) ? megagroupMark : QString())
+					+ peer->name());
+			const auto status = std::make_shared<Ui::Text::String>(
+				st::defaultTextStyle,
+				(g && !g->amIn())
+					? tr::lng_chat_status_unaccessible(tr::now)
+					: !peer->username().isEmpty()
+					? ('@' + peer->username())
+					: (count > 0)
+					? ((c && !c->isMegagroup())
+						? tr::lng_chat_status_subscribers
+						: tr::lng_chat_status_members)(
+							tr::now,
+							lt_count,
+							count)
+					: QString());
+			row->paintRequest() | rpl::start_with_next([=] {
+				auto p = QPainter(row);
 				const auto &st = st::defaultPeerListItem;
-				const auto availableWidth = width()
+				const auto availableWidth = row->width()
 					- st::boxRowPadding.right()
 					- st.namePosition.x();
 				p.setPen(st.nameFg);
@@ -207,23 +210,11 @@ not_null<Ui::SettingsButton*> AddMyChannelsBox(
 					.availableWidth = availableWidth,
 					.elisionLines = 1,
 				};
-				_text.draw(p, context);
+				text->draw(p, context);
 				p.setPen(st.statusFg);
 				context.position = st.statusPosition;
-				_status.draw(p, context);
-			}
-
-		private:
-			Ui::Text::String _text;
-			Ui::Text::String _status;
-
-		};
-
-		const auto add = [&](not_null<PeerData*> peer) {
-			const auto row = box->addRow(
-				object_ptr<Button>(box, rpl::single(QString())),
-				{});
-			row->setPeer(peer);
+				status->draw(p, context);
+			}, row->lifetime());
 			row->setClickedCallback([=] {
 				controller->showPeerHistory(peer);
 			});
@@ -233,8 +224,16 @@ not_null<Ui::SettingsButton*> AddMyChannelsBox(
 			userpic->setAttribute(Qt::WA_TransparentForMouseEvents);
 		};
 
+		const auto inaccessibleWrap = box->verticalLayout()->add(
+			object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
+				box->verticalLayout(),
+				object_ptr<Ui::VerticalLayout>(box->verticalLayout())));
+		inaccessibleWrap->toggle(false, anim::type::instant);
+
 		const auto &data = controller->session().data();
 		auto ids = std::vector<PeerId>();
+		auto inaccessibleIds = std::vector<PeerId>();
+
 		if (chats) {
 			data.enumerateGroups([&](not_null<PeerData*> peer) {
 				peer = peer->migrateToOrMe();
@@ -244,8 +243,13 @@ not_null<Ui::SettingsButton*> AddMyChannelsBox(
 				const auto c = peer->asChannel();
 				const auto g = peer->asChat();
 				if ((c && c->amCreator()) || (g && g->amCreator())) {
+					if (g && !g->amIn()) {
+						inaccessibleIds.push_back(peer->id);
+						add(peer, inaccessibleWrap->entity());
+					} else {
+						add(peer, box->verticalLayout());
+					}
 					ids.push_back(peer->id);
-					add(peer);
 				}
 			});
 		} else {
@@ -253,12 +257,28 @@ not_null<Ui::SettingsButton*> AddMyChannelsBox(
 				if (channel->amCreator()
 					&& !ranges::contains(ids, channel->id)) {
 					ids.push_back(channel->id);
-					add(channel);
+					add(channel, box->verticalLayout());
 				}
 			});
 		}
 		if (ids.empty()) {
 			addIcon(box);
+		}
+		if (!inaccessibleIds.empty()) {
+			const auto icon = [=] {
+				return !inaccessibleWrap->toggled()
+					? &st::menuIconGroups
+					: &st::menuIconGroupsHide;
+			};
+			auto button = object_ptr<Ui::IconButton>(box, st::backgroundSwitchToDark);
+			button->setClickedCallback([=, raw = button.data()] {
+				inaccessibleWrap->toggle(
+					!inaccessibleWrap->toggled(),
+					anim::type::normal);
+				raw->setIconOverride(icon(), icon());
+			});
+			button->setIconOverride(icon(), icon());
+			box->addTopButton(std::move(button));
 		}
 	};
 
@@ -334,12 +354,15 @@ void SetupMenuBots(
 					(height - icon->height()) / 2);
 			}, button->lifetime());
 			const auto weak = Ui::MakeWeak(container);
+			const auto show = controller->uiShow();
 			button->setAcceptBoth(true);
 			button->clicks(
 			) | rpl::start_with_next([=](Qt::MouseButton which) {
 				if (which == Qt::LeftButton) {
-					bots->requestSimple(controller, user, {
-						.fromMainMenu = true,
+					bots->open({
+						.bot = user,
+						.context = { .controller = controller },
+						.source = InlineBots::WebViewSourceMainMenu(),
 					});
 					if (weak) {
 						controller->window().hideSettingsAndLayer();
@@ -351,7 +374,7 @@ void SetupMenuBots(
 						st::popupMenuWithIcons);
 					(*menu)->addAction(
 						tr::lng_bot_remove_from_menu(tr::now),
-						[=] { bots->removeFromMenu(user); },
+						[=] { bots->removeFromMenu(show, user); },
 						&st::menuIconDelete);
 					(*menu)->popup(QCursor::pos());
 				}

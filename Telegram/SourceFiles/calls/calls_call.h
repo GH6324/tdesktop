@@ -31,6 +31,7 @@ enum class AudioState;
 namespace Webrtc {
 enum class VideoState;
 class VideoTrack;
+struct DeviceResolvedId;
 } // namespace Webrtc
 
 namespace Calls {
@@ -220,6 +221,13 @@ public:
 	void toggleCameraSharing(bool enabled);
 	void toggleScreenSharing(std::optional<QString> uniqueId);
 
+	[[nodiscard]] auto playbackDeviceIdValue() const
+		-> rpl::producer<Webrtc::DeviceResolvedId>;
+	[[nodiscard]] auto captureDeviceIdValue() const
+		-> rpl::producer<Webrtc::DeviceResolvedId>;
+	[[nodiscard]] auto cameraDeviceIdValue() const
+		-> rpl::producer<Webrtc::DeviceResolvedId>;
+
 	[[nodiscard]] rpl::lifetime &lifetime() {
 		return _lifetime;
 	}
@@ -277,11 +285,11 @@ private:
 	MTP::Sender _api;
 	Type _type = Type::Outgoing;
 	rpl::variable<State> _state = State::Starting;
-	rpl::variable<RemoteAudioState> _remoteAudioState =
-		RemoteAudioState::Active;
+	rpl::variable<RemoteAudioState> _remoteAudioState
+		= RemoteAudioState::Active;
 	rpl::variable<Webrtc::VideoState> _remoteVideoState;
-	rpl::variable<RemoteBatteryState> _remoteBatteryState =
-		RemoteBatteryState::Normal;
+	rpl::variable<RemoteBatteryState> _remoteBatteryState
+		= RemoteBatteryState::Normal;
 	rpl::event_stream<Error> _errors;
 	FinishType _finishAfterRequestingCall = FinishType::None;
 	bool _answerAfterDhConfigReceived = false;

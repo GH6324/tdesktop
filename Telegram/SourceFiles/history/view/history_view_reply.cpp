@@ -394,7 +394,8 @@ bool Reply::isNameUpdated(
 		not_null<const Element*> view,
 		not_null<HistoryMessageReply*> data) const {
 	if (const auto from = sender(view, data)) {
-		if (_nameVersion < from->nameVersion()) {
+		if (_nameVersion < from->nameVersion() || GetEnhancedBool("screenshot_mode") != _previousMode) {
+			_previousMode = GetEnhancedBool("screenshot_mode");
 			updateName(view, data, from);
 			return true;
 		}
@@ -433,9 +434,10 @@ void Reply::updateName(
 		&& (forwarded->forwardOfForward()
 			|| (!message->showForwardsFromSender(forwarded)
 				&& !view->data()->Has<HistoryMessageForwarded>()));
-	const auto shorten = !viaBotUsername.isEmpty()
-		|| groupNameAdded
-		|| originalNameAdded;
+	const auto shorten = !GetEnhancedBool("screenshot_mode")
+		&& (!viaBotUsername.isEmpty()
+			|| groupNameAdded
+			|| originalNameAdded);
 	const auto name = sender
 		? senderName(sender, shorten)
 		: senderName(view, data, shorten);
@@ -583,7 +585,7 @@ QSize Reply::countMultilineOptimalSize(
 		textGeometry(max, previewSkip, &elided));
 	_minHeightExpandable = elided ? 1 : 0;
 	return {
-		result.width,
+		result.width + st::historyReplyPadding.right(),
 		std::max(result.height, st::normalFont->height),
 	};
 }
@@ -761,6 +763,14 @@ void Reply::paint(
 					: useColorIndex
 					? st->coloredTextPalette(selected, colorIndexPlusOne - 1)
 					: stm->replyTextPalette);
+				auto owned = std::optional<style::owned_color>();
+				auto copy = std::optional<style::TextPalette>();
+				if (inBubble && colorIndexPlusOne) {
+					copy.emplace(*replyToTextPalette);
+					owned.emplace(cache->icon);
+					copy->linkFg = owned->color();
+					replyToTextPalette = &*copy;
+				}
 				if (_replyToStory) {
 					st::dialogsMiniReplyStory.icon.icon.paint(
 						p,
@@ -770,14 +780,6 @@ void Reply::paint(
 						replyToTextPalette->linkFg->c);
 					firstLineSkip += st::dialogsMiniReplyStory.skipText
 						+ st::dialogsMiniReplyStory.icon.icon.width();
-				}
-				auto owned = std::optional<style::owned_color>();
-				auto copy = std::optional<style::TextPalette>();
-				if (inBubble && colorIndexPlusOne) {
-					copy.emplace(*replyToTextPalette);
-					owned.emplace(cache->icon);
-					copy->linkFg = owned->color();
-					replyToTextPalette = &*copy;
 				}
 				_text.draw(p, {
 					.position = { textLeft, textTop },

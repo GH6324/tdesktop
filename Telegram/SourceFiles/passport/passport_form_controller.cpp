@@ -233,9 +233,10 @@ QString SpecialScanCredentialsKey(FileType type) {
 
 QString ValidateUrl(const QString &url) {
 	const auto result = qthelp::validate_url(url);
-	return result.startsWith("tg://", Qt::CaseInsensitive)
-		? QString()
-		: result;
+	return (result.startsWith("http://", Qt::CaseInsensitive)
+		|| result.startsWith("https://", Qt::CaseInsensitive))
+		? result
+		: QString();
 }
 
 auto ParseConfig(const QByteArray &json) {
@@ -2217,6 +2218,10 @@ void FormController::startPhoneVerification(not_null<Value*> value) {
 				bad("FirebaseSms");
 			}, [&](const MTPDauth_sentCodeTypeEmailCode &) {
 				bad("EmailCode");
+			}, [&](const MTPDauth_sentCodeTypeSmsWord &) {
+				bad("SmsWord");
+			}, [&](const MTPDauth_sentCodeTypeSmsPhrase &) {
+				bad("SmsPhrase");
 			}, [&](const MTPDauth_sentCodeTypeSetUpEmailRequired &) {
 				bad("SetUpEmailRequired");
 			});
@@ -2257,8 +2262,10 @@ void FormController::requestPhoneCall(not_null<Value*> value) {
 	value->verification.call->setStatus(
 		{ Ui::SentCodeCall::State::Calling, 0 });
 	_api.request(MTPauth_ResendCode(
+		MTP_flags(0),
 		MTP_string(getPhoneFromValue(value)),
-		MTP_string(value->verification.phoneCodeHash)
+		MTP_string(value->verification.phoneCodeHash),
+		MTPstring() // reason
 	)).done([=] {
 		value->verification.call->callDone();
 	}).send();
@@ -2686,8 +2693,8 @@ bool FormController::applyPassword(const MTPDaccount_password &result) {
 	settings.notEmptyPassport = result.is_has_secure_values();
 	settings.request = Core::ParseCloudPasswordCheckRequest(result);
 	settings.unknownAlgo = result.vcurrent_algo() && !settings.request;
-	settings.unconfirmedPattern =
-		qs(result.vemail_unconfirmed_pattern().value_or_empty());
+	settings.unconfirmedPattern = qs(
+		result.vemail_unconfirmed_pattern().value_or_empty());
 	settings.newAlgo = Core::ValidateNewCloudPasswordAlgo(
 		Core::ParseCloudPasswordAlgo(result.vnew_algo()));
 	settings.newSecureAlgo = Core::ValidateNewSecureSecretAlgo(

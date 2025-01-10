@@ -13,6 +13,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/business/data_business_info.h"
 #include "data/business/data_business_chatbots.h"
 #include "data/business/data_shortcut_messages.h"
+#include "data/stickers/data_custom_emoji.h"
 #include "data/data_changes.h"
 #include "data/data_peer_values.h" // AmPremiumValue.
 #include "data/data_session.h"
@@ -39,6 +40,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/text/text_utilities.h"
 #include "ui/widgets/checkbox.h" // Ui::RadiobuttonGroup.
 #include "ui/widgets/gradient_round_button.h"
+#include "ui/widgets/label_with_custom_emoji.h"
 #include "ui/wrap/fade_wrap.h"
 #include "ui/wrap/slide_wrap.h"
 #include "ui/wrap/vertical_layout.h"
@@ -51,6 +53,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "styles/style_info.h"
 #include "styles/style_layers.h"
 #include "styles/style_settings.h"
+#include "styles/style_chat.h"
+#include "styles/style_channel_earn.h"
 
 namespace Settings {
 namespace {
@@ -72,9 +76,10 @@ using Order = std::vector<QString>;
 		u"quick_replies"_q,
 		u"business_hours"_q,
 		u"business_location"_q,
-		u"business_bots"_q,
-		u"business_intro"_q,
 		u"business_links"_q,
+		u"business_intro"_q,
+		u"business_bots"_q,
+		u"folder_tags"_q,
 	};
 }
 
@@ -132,7 +137,6 @@ using Order = std::vector<QString>;
 				tr::lng_business_subtitle_chatbots(),
 				tr::lng_business_about_chatbots(),
 				PremiumFeature::BusinessBots,
-				true
 			},
 		},
 		{
@@ -142,7 +146,6 @@ using Order = std::vector<QString>;
 				tr::lng_business_subtitle_chat_intro(),
 				tr::lng_business_about_chat_intro(),
 				PremiumFeature::ChatIntro,
-				true
 			},
 		},
 		{
@@ -152,7 +155,16 @@ using Order = std::vector<QString>;
 				tr::lng_business_subtitle_chat_links(),
 				tr::lng_business_about_chat_links(),
 				PremiumFeature::ChatLinks,
-				true
+			},
+		},
+		{
+			u"folder_tags"_q,
+			Entry{
+				&st::settingsPremiumIconTags,
+				tr::lng_premium_summary_subtitle_filter_tags(),
+				tr::lng_premium_summary_about_filter_tags(),
+				PremiumFeature::FilterTags,
+				true,
 			},
 		},
 	};
@@ -181,7 +193,7 @@ void AddBusinessSummary(
 		const auto label = content->add(
 			object_ptr<Ui::FlatLabel>(
 				content,
-				std::move(entry.title) | rpl::map(Ui::Text::Bold),
+				std::move(entry.title) | Ui::Text::ToBold(),
 				stLabel),
 			titlePadding);
 		label->setAttribute(Qt::WA_TransparentForMouseEvents);
@@ -398,6 +410,10 @@ void Business::setupContent() {
 	Ui::AddSkip(content, st::settingsFromFileTop);
 
 	const auto showFeature = [=](PremiumFeature feature) {
+		if (feature == PremiumFeature::FilterTags) {
+			ShowPremiumPreviewToBuy(_controller, feature);
+			return;
+		}
 		showOther([&] {
 			switch (feature) {
 			case PremiumFeature::AwayMessage: return AwayMessageId();
@@ -433,6 +449,8 @@ void Business::setupContent() {
 			return owner->session().user()->isFullLoaded();
 		case PremiumFeature::ChatLinks:
 			return owner->session().api().chatLinks().loaded();
+		case PremiumFeature::FilterTags:
+			return true;
 		}
 		Unexpected("Feature in isReady.");
 	};
@@ -469,6 +487,100 @@ void Business::setupContent() {
 			showFeature(feature);
 		}
 	});
+
+	const auto sponsoredWrap = content->add(
+		object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
+			content,
+			object_ptr<Ui::VerticalLayout>(content)));
+	const auto fillSponsoredWrap = [=] {
+		while (sponsoredWrap->entity()->count()) {
+			delete sponsoredWrap->entity()->widgetAt(0);
+		}
+		Ui::AddDivider(sponsoredWrap->entity());
+		const auto loading = sponsoredWrap->entity()->add(
+			object_ptr<Ui::SlideWrap<Ui::FlatLabel>>(
+				sponsoredWrap->entity(),
+				object_ptr<Ui::FlatLabel>(
+					sponsoredWrap->entity(),
+					tr::lng_contacts_loading())),
+			st::boxRowPadding);
+		loading->entity()->setTextColorOverride(st::windowSubTextFg->c);
+
+		const auto wrap = sponsoredWrap->entity()->add(
+			object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
+				sponsoredWrap->entity(),
+				object_ptr<Ui::VerticalLayout>(sponsoredWrap->entity())));
+		wrap->toggle(false, anim::type::instant);
+		const auto inner = wrap->entity();
+		Ui::AddSkip(inner);
+		Ui::AddSubsectionTitle(
+			inner,
+			tr::lng_business_subtitle_sponsored());
+		const auto button = inner->add(object_ptr<Ui::SettingsButton>(
+			inner,
+			tr::lng_business_button_sponsored()));
+		Ui::AddSkip(inner);
+
+		const auto session = &_controller->session();
+		{
+			const auto arrow = Ui::Text::SingleCustomEmoji(
+				session->data().customEmojiManager().registerInternalEmoji(
+					st::topicButtonArrow,
+					st::channelEarnLearnArrowMargins,
+					true));
+			inner->add(object_ptr<Ui::DividerLabel>(
+				inner,
+				Ui::CreateLabelWithCustomEmoji(
+					inner,
+					tr::lng_business_about_sponsored(
+						lt_link,
+						rpl::combine(
+							tr::lng_business_about_sponsored_link(
+								lt_emoji,
+								rpl::single(arrow),
+								Ui::Text::RichLangValue),
+							tr::lng_business_about_sponsored_url()
+						) | rpl::map([](TextWithEntities text, QString url) {
+							return Ui::Text::Link(text, url);
+						}),
+						Ui::Text::RichLangValue),
+					{ .session = session },
+					st::boxDividerLabel),
+				st::defaultBoxDividerLabelPadding,
+				RectPart::Top | RectPart::Bottom));
+		}
+
+		const auto api = inner->lifetime().make_state<Api::SponsoredToggle>(
+			session);
+
+		api->toggled(
+		) | rpl::start_with_next([=](bool enabled) {
+			button->toggleOn(rpl::single(enabled));
+			wrap->toggle(true, anim::type::instant);
+			loading->toggle(false, anim::type::instant);
+
+			button->toggledChanges(
+			) | rpl::start_with_next([=](bool toggled) {
+				api->setToggled(
+					toggled
+				) | rpl::start_with_error_done([=](const QString &error) {
+					_controller->showToast(error);
+				}, [] {
+				}, button->lifetime());
+			}, button->lifetime());
+		}, inner->lifetime());
+
+		Ui::ToggleChildrenVisibility(sponsoredWrap->entity(), true);
+		sponsoredWrap->entity()->resizeToWidth(content->width());
+	};
+	Data::AmPremiumValue(
+		&_controller->session()
+	) | rpl::start_with_next([=](bool isPremium) {
+		sponsoredWrap->toggle(isPremium, anim::type::normal);
+		if (isPremium) {
+			fillSponsoredWrap();
+		}
+	}, content->lifetime());
 
 	Ui::ResizeFitChild(this, content);
 }
@@ -514,23 +626,10 @@ QPointer<Ui::RpWidget> Business::createPinnedToTop(
 		content->setRoundEdges(wrap == Info::Wrap::Layer);
 	}, content->lifetime());
 
-	const auto calculateMaximumHeight = [=] {
-		return st::settingsPremiumTopHeight;
-	};
-
-	content->setMaximumHeight(calculateMaximumHeight());
-	content->setMinimumHeight(st::settingsPremiumTopHeight);// st::infoLayerTopBarHeight);
+	content->setMaximumHeight(st::settingsPremiumTopHeight);
+	content->setMinimumHeight(st::settingsPremiumTopHeight);
 
 	content->resize(content->width(), content->maximumHeight());
-	//content->additionalHeight(
-	//) | rpl::start_with_next([=](int additionalHeight) {
-	//	const auto wasMax = (content->height() == content->maximumHeight());
-	//	content->setMaximumHeight(calculateMaximumHeight()
-	//		+ additionalHeight);
-	//	if (wasMax) {
-	//		content->resize(content->width(), content->maximumHeight());
-	//	}
-	//}, content->lifetime());
 
 	_wrap.value(
 	) | rpl::start_with_next([=](Info::Wrap wrap) {
@@ -605,8 +704,8 @@ QPointer<Ui::RpWidget> Business::createPinnedToBottom(
 	});
 	{
 		const auto callback = [=](int value) {
-			const auto options =
-				_controller->session().api().premium().subscriptionOptions();
+			auto &api = _controller->session().api();
+			const auto options = api.premium().subscriptionOptions();
 			if (options.empty()) {
 				return;
 			}
@@ -706,12 +805,14 @@ std::vector<PremiumFeature> BusinessFeaturesOrder(
 			return PremiumFeature::BusinessHours;
 		} else if (s == u"business_location"_q) {
 			return PremiumFeature::BusinessLocation;
-		} else if (s == u"business_bots"_q) {
-			return PremiumFeature::BusinessBots;
+		} else if (s == u"business_links"_q) {
+			return PremiumFeature::ChatLinks;
 		} else if (s == u"business_intro"_q) {
 			return PremiumFeature::ChatIntro;
-		} else if (s == "business_links"_q) {
-			return PremiumFeature::ChatLinks;
+		} else if (s == u"business_bots"_q) {
+			return PremiumFeature::BusinessBots;
+		} else if (s == u"folder_tags"_q) {
+			return PremiumFeature::FilterTags;
 		}
 		return PremiumFeature::kCount;
 	}) | ranges::views::filter([](PremiumFeature feature) {

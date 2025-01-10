@@ -9,13 +9,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "api/api_text_entities.h"
 #include "data/business/data_shortcut_messages.h"
+#include "data/components/scheduled_messages.h"
 #include "data/data_session.h"
 #include "data/data_channel.h"
 #include "data/data_chat.h"
 #include "data/data_folder.h"
 #include "data/data_forum.h"
 #include "data/data_forum_topic.h"
-#include "data/data_scheduled_messages.h"
 #include "data/data_user.h"
 #include "base/unixtime.h"
 #include "base/random.h"
@@ -32,6 +32,7 @@ namespace Data {
 namespace {
 
 constexpr auto kReadRequestTimeout = 3 * crl::time(1000);
+constexpr auto kReportDeliveriesPerRequest = 50;
 
 } // namespace
 
@@ -55,7 +56,8 @@ MTPInputReplyTo ReplyToForMTP(
 				? replyingToTopic->rootId()
 				: Data::ForumTopic::kGeneralId)
 			: (to ? to->topicRootId() : Data::ForumTopic::kGeneralId);
-		const auto replyToTopicId = to
+		const auto replyToTopicId = (to
+			&& (to->history() != history || to->id != replyingToTopicId))
 			? to->topicRootId()
 			: replyingToTopicId;
 		const auto external = replyTo.messageId
@@ -571,6 +573,58 @@ void Histories::sendPendingReadInbox(not_null<History*> history) {
 	}
 }
 
+void Histories::reportDelivery(not_null<HistoryItem*> item) {
+	auto &set = _pendingDeliveryReport[item->history()->peer];
+	if (!set.emplace(item->id).second) {
+		return;
+	}
+	crl::on_main(&session(), [=] {
+		reportPendingDeliveries();
+	});
+}
+
+void Histories::reportPendingDeliveries() {
+	auto &pending = _pendingDeliveryReport;
+	for (auto i = begin(pending); i != end(pending);) {
+		auto &[peer, ids] = *i;
+		auto list = QVector<MTPint>();
+		if (_deliveryReportSent.contains(peer)) {
+			++i;
+			continue;
+		} else if (ids.size() > kReportDeliveriesPerRequest) {
+			const auto count = kReportDeliveriesPerRequest;
+			list.reserve(count);
+			for (auto j = begin(ids), till = j + count; j != till; ++j) {
+				list.push_back(MTP_int(*j));
+			}
+			ids.erase(begin(ids), begin(ids) + count);
+		} else if (!ids.empty()) {
+			list.reserve(ids.size());
+			for (const auto &id : ids) {
+				list.push_back(MTP_int(id));
+			}
+			ids.clear();
+		}
+		if (ids.empty()) {
+			i = pending.erase(i);
+		} else {
+			++i;
+		}
+		_deliveryReportSent.emplace(peer);
+		const auto finish = [=] {
+			_deliveryReportSent.remove(peer);
+			if (_pendingDeliveryReport.contains(peer)) {
+				reportPendingDeliveries();
+			}
+		};
+		session().api().request(MTPmessages_ReportMessagesDelivery(
+			MTP_flags(0),
+			peer->input,
+			MTP_vector(std::move(list))
+		)).done(finish).fail(finish).send();
+	}
+}
+
 void Histories::sendReadRequests() {
 	DEBUG_LOG(("Reading: send requests with count %1.").arg(_states.size()));
 	if (_states.empty()) {
@@ -836,11 +890,12 @@ void Histories::deleteMessages(const MessageIdsList &ids, bool revoke) {
 			if (item->isScheduled()) {
 				const auto wasOnServer = !item->isSending()
 					&& !item->hasFailed();
+				auto &scheduled = _owner->session().scheduledMessages();
 				if (wasOnServer) {
-					scheduledIdsByPeer[history->peer].push_back(MTP_int(
-						_owner->scheduledMessages().lookupId(item)));
+					scheduledIdsByPeer[history->peer].push_back(
+						MTP_int(scheduled.lookupId(item)));
 				} else {
-					_owner->scheduledMessages().removeSending(item);
+					scheduled.removeSending(item);
 				}
 				continue;
 			} else if (item->isBusinessShortcut()) {

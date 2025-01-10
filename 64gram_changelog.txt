@@ -1,3 +1,59 @@
+1.1.31 (08.07.24)
+
+- No changelog
+
+1.1.30 (03.07.24)
+
+- No changelog
+
+1.1.29 (16.06.24)
+
+- No changelog
+
+1.1.28 (08.06.24)
+
+- No changelog
+
+1.1.27 (06.06.24)
+
+- No changelog
+
+1.1.26 (02.06.24)
+
+- [Fix] modifyChosenRow nullptr issue
+
+1.1.24 (29.05.24)
+
+- [Change] not allow to add account when 10 accounts signed in
+- [Fix] blocked user spoiler entities
+
+1.1.23 (25.05.24)
+
+- [New] recent sticker display limit 
+- [Fix] always delete for option
+
+1.1.22 (05.05.24)
+
+- [Fix] show message seconds
+
+1.1.21 (04.05.24)
+
+- [Remove] stickerset preview
+
+1.1.20 (03.05.24)
+
+- [Fix] account can't open in new window
+
+1.1.19 (20.04.24)
+
+- [It's back] upload speed boost
+- [UI] Increase maxSignatureSize width
+
+1.1.18 (17.04.24)
+
+- [Fix] hide all chats
+- [UI] Show Instant view, ad button
+
 1.1.17 (10.04.24)
 
 - [Fix] create new supergroup

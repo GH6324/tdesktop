@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "api/api_updates.h"
 #include "api/api_views.h"
+#include "data/components/scheduled_messages.h"
 #include "data/data_document_media.h"
 #include "data/data_document_resolver.h"
 #include "data/data_forum_topic.h"
@@ -22,7 +23,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_chat.h"
 #include "data/data_user.h"
 #include "data/data_chat_filters.h"
-#include "data/data_scheduled_messages.h"
 #include "data/data_file_origin.h"
 #include "data/data_histories.h"
 #include "data/stickers/data_stickers.h"
@@ -34,21 +34,25 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/resize_area.h"
 #include "ui/text/text_utilities.h"
 #include "ui/toast/toast.h"
+#include "ui/ui_utility.h"
 #include "window/window_connecting_widget.h"
 #include "window/window_top_bar_wrap.h"
 #include "window/notifications_manager.h"
+#include "window/window_separate_id.h"
 #include "window/window_slide_animation.h"
 #include "window/window_history_hider.h"
 #include "window/window_controller.h"
 #include "window/window_peer_menu.h"
+#include "window/window_session_controller_link_info.h"
 #include "window/themes/window_theme.h"
+#include "chat_helpers/bot_command.h"
 #include "chat_helpers/tabbed_selector.h" // TabbedSelector::refreshStickers
 #include "chat_helpers/message_field.h"
 #include "info/info_memento.h"
 #include "apiwrap.h"
 #include "dialogs/dialogs_widget.h"
 #include "history/history_widget.h"
-#include "history/history_item_helpers.h" // GetErrorTextForSending.
+#include "history/history_item_helpers.h" // GetErrorForSending.
 #include "history/view/media/history_view_media.h"
 #include "history/view/history_view_service_message.h"
 #include "history/view/history_view_sublist_section.h"
@@ -91,6 +95,16 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QMimeData>
+
+namespace {
+
+void ClearBotStartToken(PeerData *peer) {
+	if (peer && peer->isUser() && peer->asUser()->isBot()) {
+		peer->asUser()->botInfo->startToken = QString();
+	}
+}
+
+} // namespace
 
 enum StackItemType {
 	HistoryStackItem,
@@ -232,19 +246,19 @@ MainWidget::MainWidget(
 , _controller(controller)
 , _dialogsWidth(st::columnMinimalWidthLeft)
 , _thirdColumnWidth(st::columnMinimalWidthThird)
-, _sideShadow(isPrimary()
-	? base::make_unique_q<Ui::PlainShadow>(this)
-	: nullptr)
-, _dialogs(isPrimary()
+, _dialogs(windowId().hasChatsList()
 	? base::make_unique_q<Dialogs::Widget>(
 		this,
 		_controller,
 		Dialogs::Widget::Layout::Main)
 	: nullptr)
 , _history(std::in_place, this, _controller)
+, _sideShadow(_dialogs
+	? base::make_unique_q<Ui::PlainShadow>(this)
+	: nullptr)
 , _playerPlaylist(this, _controller)
 , _changelogs(Core::Changelogs::Create(&controller->session())) {
-	if (isPrimary()) {
+	if (_dialogs) {
 		setupConnectingWidget();
 	}
 
@@ -296,15 +310,23 @@ MainWidget::MainWidget(
 		_player->finishAnimating();
 	}
 
-	rpl::merge(
-		_controller->dialogsListFocusedChanges(),
-		_controller->dialogsListDisplayForcedChanges()
+	_controller->chatsForceDisplayWideChanges(
 	) | rpl::start_with_next([=] {
-		updateDialogsWidthAnimated();
+		crl::on_main(this, [=] {
+			updateDialogsWidthAnimated();
+		});
 	}, lifetime());
 
+	const auto filter = [=](bool mainSectionShown) {
+		return rpl::filter([=] {
+			return (_controller->mainSectionShown() == mainSectionShown);
+		});
+	};
 	rpl::merge(
-		Core::App().settings().dialogsWidthRatioChanges() | rpl::to_empty,
+		Core::App().settings().dialogsWithChatWidthRatioChanges(
+		) | filter(true) | rpl::to_empty,
+		Core::App().settings().dialogsNoChatWidthRatioChanges(
+		) | filter(false) | rpl::to_empty,
 		Core::App().settings().thirdColumnWidthChanges() | rpl::to_empty
 	) | rpl::start_with_next([=] {
 		updateControlsGeometry();
@@ -401,7 +423,7 @@ MainWidget::MainWidget(
 
 	cSetOtherOnline(0);
 
-	_history->start();
+	session().data().stickers().notifySavedGifsUpdated();
 }
 
 MainWidget::~MainWidget() = default;
@@ -534,15 +556,15 @@ bool MainWidget::setForwardDraft(
 	const auto history = thread->owningHistory();
 	const auto items = session().data().idsToItems(draft.ids);
 	const auto topicRootId = thread->topicRootId();
-	const auto error = GetErrorTextForSending(
+	const auto error = GetErrorForSending(
 		history->peer,
 		{
 			.topicRootId = topicRootId,
 			.forward = &items,
 			.ignoreSlowmodeCountdown = true,
 		});
-	if (!error.isEmpty()) {
-		_controller->show(Ui::MakeInformBox(error));
+	if (error) {
+		Data::ShowSendErrorToast(_controller, history->peer, error);
 		return false;
 	}
 
@@ -589,12 +611,12 @@ bool MainWidget::sendPaths(
 		not_null<Data::Thread*> thread,
 		const QStringList &paths) {
 	if (!Data::CanSendAnyOf(thread, Data::FilesSendRestrictions())) {
-		_controller->show(Ui::MakeInformBox(
-			tr::lng_forward_send_files_cant()));
+		_controller->showToast(
+			tr::lng_forward_send_files_cant(tr::now));
 		return false;
 	} else if (const auto error = Data::AnyFileRestrictionError(
 			thread->peer())) {
-		_controller->show(Ui::MakeInformBox(*error));
+		Data::ShowSendErrorToast(controller(), thread->peer(), error);
 		return false;
 	} else {
 		_controller->showThread(
@@ -637,12 +659,12 @@ bool MainWidget::filesOrForwardDrop(
 		}
 		return false;
 	} else if (!Data::CanSendAnyOf(thread, Data::FilesSendRestrictions())) {
-		_controller->show(Ui::MakeInformBox(
-			tr::lng_forward_send_files_cant()));
+		_controller->showToast(
+			tr::lng_forward_send_files_cant(tr::now));
 		return false;
 	} else if (const auto error = Data::AnyFileRestrictionError(
 			thread->peer())) {
-		_controller->show(Ui::MakeInformBox(*error));
+		Data::ShowSendErrorToast(_controller, thread->peer(), error);
 		return false;
 	} else {
 		_controller->showThread(
@@ -722,9 +744,31 @@ void MainWidget::hideSingleUseKeyboard(FullMsgId replyToId) {
 	_history->hideSingleUseKeyboard(replyToId);
 }
 
-void MainWidget::searchMessages(const QString &query, Dialogs::Key inChat, PeerData *from) {
-	if (controller()->isPrimary()) {
-		_dialogs->searchMessages(query, inChat, from);
+void MainWidget::searchMessages(
+		const QString &query,
+		Dialogs::Key inChat,
+		PeerData *searchFrom) {
+	const auto complex = Data::HashtagWithUsernameFromQuery(query);
+	if (!complex.username.isEmpty()) {
+		_controller->showPeerByLink(Window::PeerByLinkInfo{
+			.usernameOrId = complex.username,
+			.text = complex.hashtag,
+			.resolveType = Window::ResolveType::HashtagSearch,
+		});
+		return;
+	}
+	auto tags = Data::SearchTagsFromQuery(query);
+	if (_dialogs) {
+		auto state = Dialogs::SearchState{
+			.inChat = ((tags.empty() || inChat.sublist())
+				? inChat
+				: session().data().history(session().user())),
+			.fromPeer = inChat ? searchFrom : nullptr,
+			.tags = tags,
+			.query = tags.empty() ? query : QString(),
+		};
+		state.tab = state.defaultTabForMe();
+		_dialogs->searchMessages(std::move(state));
 		if (isOneColumn()) {
 			_controller->clearSectionStack();
 		} else {
@@ -734,17 +778,20 @@ void MainWidget::searchMessages(const QString &query, Dialogs::Key inChat, PeerD
 		if (const auto sublist = inChat.sublist()) {
 			controller()->showSection(
 				std::make_shared<HistoryView::SublistMemento>(sublist));
-		} else if (!Data::SearchTagsFromQuery(query).empty()) {
+		} else if (!tags.empty()) {
 			inChat = controller()->session().data().history(
 				controller()->session().user());
 		}
 		if ((!_mainSection
-			|| !_mainSection->searchInChatEmbedded(inChat, query))
-			&& !_history->searchInChatEmbedded(inChat, query)) {
-			const auto account = &session().account();
+			|| !_mainSection->searchInChatEmbedded(query, inChat, searchFrom))
+			&& !_history->searchInChatEmbedded(query, inChat, searchFrom)) {
+			const auto account = not_null(&session().account());
 			if (const auto window = Core::App().windowFor(account)) {
 				if (const auto controller = window->sessionController()) {
-					controller->content()->searchMessages(query, inChat, nullptr);
+					controller->content()->searchMessages(
+						query,
+						inChat,
+						searchFrom);
 					controller->widget()->activate();
 				}
 			}
@@ -811,6 +858,13 @@ void MainWidget::createPlayer() {
 		});
 		_player->entity()->setShowItemCallback([=](
 				not_null<const HistoryItem*> item) {
+			const auto peer = item->history()->peer;
+			if (const auto window = Core::App().windowFor(peer)) {
+				if (const auto controller = window->sessionController()) {
+					controller->showMessage(item);
+					return;
+				}
+			}
 			_controller->showMessage(item);
 		});
 
@@ -1032,18 +1086,8 @@ void MainWidget::exportTopBarHeightUpdated() {
 	}
 }
 
-SendMenu::Type MainWidget::sendMenuType() const {
-	return _history->sendMenuType();
-}
-
-bool MainWidget::sendExistingDocument(not_null<DocumentData*> document) {
-	return sendExistingDocument(document, {});
-}
-
-bool MainWidget::sendExistingDocument(
-		not_null<DocumentData*> document,
-		Api::SendOptions options) {
-	return _history->sendExistingDocument(document, options);
+SendMenu::Details MainWidget::sendMenuDetails() const {
+	return _history->sendMenuDetails();
 }
 
 void MainWidget::dialogsCancelled() {
@@ -1052,6 +1096,12 @@ void MainWidget::dialogsCancelled() {
 		clearHider(_hider);
 	}
 	_history->activate();
+}
+
+void MainWidget::toggleFiltersMenu(bool value) const {
+	if (_dialogs) {
+		_dialogs->toggleFiltersMenu(value);
+	}
 }
 
 void MainWidget::setChatBackground(
@@ -1160,39 +1210,40 @@ Image *MainWidget::newBackgroundThumb() {
 }
 
 void MainWidget::setInnerFocus() {
-	if (_hider || !_history->peer()) {
-		if (!_hider && _mainSection) {
-			_mainSection->setInnerFocus();
-		} else if (!_hider && _thirdSection) {
-			_thirdSection->setInnerFocus();
+	const auto setTo = [&](auto &&widget) {
+		if (widget->isHidden()) {
+			// If we try setting focus inside a hidden widget, we may
+			// end up focusing search field in dialogs on window activation.
+			setFocus();
 		} else {
-			Assert(_dialogs != nullptr);
-			_dialogs->setInnerFocus();
+			widget->setInnerFocus();
+		}
+	};
+	if (_dialogs && _dialogs->searchHasFocus()) {
+		setTo(_dialogs);
+	} else if (_hider || !_history->peer()) {
+		if (!_hider && _mainSection) {
+			setTo(_mainSection);
+		} else if (!_hider && _thirdSection) {
+			setTo(_thirdSection);
+		} else if (_dialogs) {
+			setTo(_dialogs);
+		} else {
+			// Maybe we're just closing a child window, content is destroyed.
+			_history->setFocus();
 		}
 	} else if (_mainSection) {
-		_mainSection->setInnerFocus();
-	} else if (_history->peer() || !_thirdSection) {
-		_history->setInnerFocus();
+		setTo(_mainSection);
 	} else {
-		_thirdSection->setInnerFocus();
+		setTo(_history);
 	}
-}
-
-void MainWidget::clearBotStartToken(PeerData *peer) {
-	if (peer && peer->isUser() && peer->asUser()->isBot()) {
-		peer->asUser()->botInfo->startToken = QString();
-	}
-}
-
-void MainWidget::ctrlEnterSubmitUpdated() {
-	_history->updateFieldSubmitSettings();
 }
 
 void MainWidget::showChooseReportMessages(
 		not_null<PeerData*> peer,
-		Ui::ReportReason reason,
-		Fn<void(MessageIdsList)> done) {
-	_history->setChooseReportMessagesDetails(reason, std::move(done));
+		Data::ReportInput reportInput,
+		Fn<void(std::vector<MsgId>)> done) {
+	_history->setChooseReportMessagesDetails(reportInput, std::move(done));
 	_controller->showPeerHistory(
 		peer,
 		SectionShow::Way::Forward,
@@ -1214,36 +1265,36 @@ bool MainWidget::showHistoryInDifferentWindow(
 		PeerId peerId,
 		const SectionShow &params,
 		MsgId showAtMsgId) {
+	if (!peerId) {
+		// In case we don't have dialogs, we can't clear section stack.
+		return !_dialogs;
+	}
 	const auto peer = session().data().peer(peerId);
-	const auto account = &session().account();
-	auto primary = Core::App().separateWindowForAccount(account);
-	if (const auto separate = Core::App().separateWindowForPeer(peer)) {
-		if (separate == &_controller->window()) {
-			return false;
+	if (const auto separateChat = _controller->windowId().chat()) {
+		if (const auto history = separateChat->asHistory()) {
+			if (history->peer == peer) {
+				return false;
+			}
 		}
-		separate->sessionController()->showPeerHistory(
+	}
+	const auto window = Core::App().windowForShowingHistory(peer);
+	if (window == &_controller->window()) {
+		return false;
+	} else if (window) {
+		window->sessionController()->showPeerHistory(
 			peerId,
 			params,
 			showAtMsgId);
-		separate->activate();
+		window->activate();
 		return true;
-	} else if (isPrimary()) {
-		if (primary && primary != &_controller->window()) {
-			primary->sessionController()->showPeerHistory(
-				peerId,
-				params,
-				showAtMsgId);
-			primary->activate();
-			return true;
-		}
+	} else if (windowId().hasChatsList()) {
 		return false;
-	} else if (!peerId) {
-		return true;
-	} else if (singlePeer()->id == peerId) {
-		return false;
-	} else if (!primary) {
+	}
+	const auto account = not_null(&session().account());
+	auto primary = Core::App().separateWindowFor(account);
+	if (!primary) {
 		Core::App().domain().activate(account);
-		primary = Core::App().separateWindowForAccount(account);
+		primary = Core::App().separateWindowFor(account);
 	}
 	if (primary && &primary->account() == account) {
 		primary->sessionController()->showPeerHistory(
@@ -1260,17 +1311,23 @@ void MainWidget::showHistory(
 		const SectionShow &params,
 		MsgId showAtMsgId) {
 	if (peerId && _controller->window().locked()) {
+		if (params.activation != anim::activation::background) {
+			_controller->window().activate();
+		}
 		return;
 	} else if (auto peer = session().data().peerLoaded(peerId)) {
 		if (peer->migrateTo()) {
 			peer = peer->migrateTo();
 			peerId = peer->id;
-			if (showAtMsgId > 0) showAtMsgId = -showAtMsgId;
+			if (showAtMsgId > 0) {
+				showAtMsgId = -showAtMsgId;
+			}
 		}
 		const auto unavailable = peer->computeUnavailableReason();
 		if (!unavailable.isEmpty()) {
-			Assert(isPrimary());
-			if (params.activation != anim::activation::background) {
+			if (!isPrimary()) {
+				_controller->window().close();
+			} else if (params.activation != anim::activation::background) {
 				_controller->show(Ui::MakeInformBox(unavailable));
 				_controller->window().activate();
 			}
@@ -1281,6 +1338,9 @@ void MainWidget::showHistory(
 		&& _mainSection
 		&& _mainSection->showMessage(peerId, params, showAtMsgId)) {
 		session().data().hideShownSpoilers();
+		if (params.activation != anim::activation::background) {
+			_controller->window().activate();
+		}
 		return;
 	} else if (showHistoryInDifferentWindow(peerId, params, showAtMsgId)) {
 		return;
@@ -1308,7 +1368,6 @@ void MainWidget::showHistory(
 		}
 	}
 
-	_controller->setDialogsListFocused(false);
 	_a_dialogsWidth.stop();
 
 	using Way = SectionShow::Way;
@@ -1317,7 +1376,7 @@ void MainWidget::showHistory(
 	bool foundInStack = !peerId;
 	if (foundInStack || (way == Way::ClearStack)) {
 		for (const auto &item : _stack) {
-			clearBotStartToken(item->peer());
+			ClearBotStartToken(item->peer());
 		}
 		_stack.clear();
 	} else {
@@ -1325,7 +1384,7 @@ void MainWidget::showHistory(
 			if (_stack.at(i)->type() == HistoryStackItem && _stack.at(i)->peer()->id == peerId) {
 				foundInStack = true;
 				while (int(_stack.size()) > i + 1) {
-					clearBotStartToken(_stack.back()->peer());
+					ClearBotStartToken(_stack.back()->peer());
 					_stack.pop_back();
 				}
 				_stack.pop_back();
@@ -1387,7 +1446,7 @@ void MainWidget::showHistory(
 	if (_history->peer()
 		&& _history->peer()->id != peerId
 		&& way != Way::Forward) {
-		clearBotStartToken(_history->peer());
+		ClearBotStartToken(_history->peer());
 	}
 	_history->showHistory(
 		peerId,
@@ -1402,6 +1461,7 @@ void MainWidget::showHistory(
 	auto onlyDialogs = noPeer && isOneColumn();
 	_mainSection.destroy();
 
+	updateMainSectionShown();
 	updateControlsGeometry();
 
 	if (noPeer) {
@@ -1466,16 +1526,27 @@ void MainWidget::showMessage(
 	if (!v::is_null(params.origin)) {
 		if (_mainSection) {
 			if (_mainSection->showMessage(peerId, params, itemId)) {
+				if (params.activation != anim::activation::background) {
+					_controller->window().activate();
+					_controller->window().hideSettingsAndLayer();
+				}
 				return;
 			}
 		} else if (_history->peer() == item->history()->peer) {
+			// showHistory may be redirected to different window,
+			// so we don't call activate() on current controller's window.
 			showHistory(peerId, params, itemId);
 			return;
 		}
 	}
 	if (const auto topic = item->topic()) {
 		_controller->showTopic(topic, item->id, params);
+		if (params.activation != anim::activation::background) {
+			_controller->window().activate();
+		}
 	} else {
+		// showPeerHistory may be redirected to different window,
+		// so we don't call activate() on current controller's window.
 		_controller->showPeerHistory(
 			item->history(),
 			params,
@@ -1486,12 +1557,12 @@ void MainWidget::showMessage(
 void MainWidget::showForum(
 		not_null<Data::Forum*> forum,
 		const SectionShow &params) {
-	Expects(isPrimary() || (singlePeer() && singlePeer()->forum() == forum));
+	Expects(_dialogs != nullptr);
 
 	_dialogs->showForum(forum, params);
 
 	if (params.activation != anim::activation::background) {
-		_controller->hideLayer();
+		_controller->window().hideSettingsAndLayer();
 	}
 }
 
@@ -1701,7 +1772,6 @@ void MainWidget::showNewSection(
 		_controller->window().hideSettingsAndLayer();
 	}
 
-	_controller->setDialogsListFocused(false);
 	_a_dialogsWidth.stop();
 
 	auto mainSectionTop = getMainSectionTop();
@@ -1758,7 +1828,7 @@ void MainWidget::showNewSection(
 		_thirdSection = std::move(newThirdSection);
 		_thirdSection->removeRequests(
 		) | rpl::start_with_next([=] {
-			_thirdSection.destroy();
+			destroyThirdSection();
 			_thirdShadow.destroy();
 			updateControlsGeometry();
 		}, _thirdSection->lifetime());
@@ -1776,6 +1846,7 @@ void MainWidget::showNewSection(
 		if (const auto entry = _mainSection->activeChat(); entry.key) {
 			_controller->setActiveChatEntry(entry);
 		}
+		updateMainSectionShown();
 
 		// Depends on SessionController::activeChatEntry
 		// for tabbed selector showing in the third column.
@@ -1810,26 +1881,20 @@ void MainWidget::checkMainSectionToLayer() {
 	}
 	Ui::FocusPersister persister(this);
 	if (auto layer = _mainSection->moveContentToLayer(rect())) {
-		dropMainSection(_mainSection);
+		_mainSection.destroy();
+		_controller->showBackFromStack(
+			SectionShow(
+				anim::type::instant,
+				anim::activation::background));
 		_controller->showSpecialLayer(
 			std::move(layer),
 			anim::type::instant);
 	}
+	updateMainSectionShown();
 }
 
-void MainWidget::dropMainSection(Window::SectionWidget *widget) {
-	if (_mainSection != widget) {
-		return;
-	}
-	_mainSection.destroy();
-	_controller->showBackFromStack(
-		SectionShow(
-			anim::type::instant,
-			anim::activation::background));
-}
-
-PeerData *MainWidget::singlePeer() const {
-	return _controller->singlePeer();
+Window::SeparateId MainWidget::windowId() const {
+	return _controller->windowId();
 }
 
 bool MainWidget::isPrimary() const {
@@ -1926,31 +1991,30 @@ void MainWidget::showNonPremiumLimitToast(bool download) {
 			? tr::lng_limit_download_title
 			: tr::lng_limit_upload_title)(tr::now),
 		.text = std::move(text),
-		.duration = 5 * crl::time(1000),
-		.slideSide = RectPart::Top,
 		.filter = std::move(filter),
+		.attach = RectPart::Top,
+		.duration = 5 * crl::time(1000),
 	});
 }
 
-void MainWidget::showBackFromStack(
-		const SectionShow &params) {
+bool MainWidget::showBackFromStack(const SectionShow &params) {
 	if (preventsCloseSection([=] { showBackFromStack(params); }, params)) {
-		return;
+		return false;
 	}
 
 	if (_stack.empty()) {
-		if (isPrimary()) {
+		if (_dialogs) {
 			_controller->clearSectionStack(params);
 		}
 		crl::on_main(this, [=] {
 			_controller->widget()->setInnerFocus();
 		});
-		return;
+		return (_dialogs != nullptr);
 	}
 	auto item = std::move(_stack.back());
 	_stack.pop_back();
-	if (auto currentHistoryPeer = _history->peer()) {
-		clearBotStartToken(currentHistoryPeer);
+	if (const auto currentHistoryPeer = _history->peer()) {
+		ClearBotStartToken(currentHistoryPeer);
 	}
 	_thirdSectionFromStack = item->takeThirdSectionMemento();
 	if (item->type() == HistoryStackItem) {
@@ -1977,6 +2041,7 @@ void MainWidget::showBackFromStack(
 				anim::activation::background));
 
 	}
+	return true;
 }
 
 void MainWidget::orderWidgets() {
@@ -2231,13 +2296,18 @@ void MainWidget::resizeEvent(QResizeEvent *e) {
 	updateControlsGeometry();
 }
 
+void MainWidget::updateMainSectionShown() {
+	_controller->setMainSectionShown(_mainSection || _history->peer());
+}
+
 void MainWidget::updateControlsGeometry() {
 	if (!width()) {
 		return;
 	}
 	updateWindowAdaptiveLayout();
 	if (_dialogs) {
-		if (Core::App().settings().dialogsWidthRatio() > 0) {
+		const auto nochat = !_controller->mainSectionShown();
+		if (Core::App().settings().dialogsWidthRatio(nochat) > 0) {
 			_a_dialogsWidth.stop();
 		}
 		if (!_a_dialogsWidth.animating()) {
@@ -2275,7 +2345,7 @@ void MainWidget::updateControlsGeometry() {
 			}
 		}
 	} else {
-		_thirdSection.destroy();
+		destroyThirdSection();
 		_thirdShadow.destroy();
 	}
 	const auto mainSectionTop = getMainSectionTop();
@@ -2394,6 +2464,15 @@ void MainWidget::updateControlsGeometry() {
 	floatPlayerUpdatePositions();
 }
 
+void MainWidget::destroyThirdSection() {
+	if (const auto strong = _thirdSection.data()) {
+		if (Ui::InFocusChain(strong)) {
+			setFocus();
+		}
+	}
+	_thirdSection.destroy();
+}
+
 void MainWidget::refreshResizeAreas() {
 	if (!isOneColumn() && _dialogs) {
 		ensureFirstColumnResizeAreaCreated();
@@ -2439,19 +2518,22 @@ void MainWidget::ensureFirstColumnResizeAreaCreated() {
 		return;
 	}
 	auto moveLeftCallback = [=](int globalLeft) {
-		auto newWidth = globalLeft - mapToGlobal(QPoint(0, 0)).x();
-		auto newRatio = (newWidth < st::columnMinimalWidthLeft / 2)
+		const auto newWidth = globalLeft - mapToGlobal(QPoint(0, 0)).x();
+		const auto newRatio = (newWidth < st::columnMinimalWidthLeft / 2)
 			? 0.
 			: float64(newWidth) / width();
-		Core::App().settings().setDialogsWidthRatio(newRatio);
+		const auto nochat = !_controller->mainSectionShown();
+		Core::App().settings().updateDialogsWidthRatio(newRatio, nochat);
 	};
 	auto moveFinishedCallback = [=] {
 		if (isOneColumn()) {
 			return;
 		}
-		if (Core::App().settings().dialogsWidthRatio() > 0) {
-			Core::App().settings().setDialogsWidthRatio(
-				float64(_dialogsWidth) / width());
+		const auto nochat = !_controller->mainSectionShown();
+		if (Core::App().settings().dialogsWidthRatio(nochat) > 0) {
+			Core::App().settings().updateDialogsWidthRatio(
+				float64(_dialogsWidth) / width(),
+				nochat);
 		}
 		Core::App().saveSettingsDelayed();
 	};
@@ -2486,12 +2568,13 @@ void MainWidget::ensureThirdColumnResizeAreaCreated() {
 }
 
 void MainWidget::updateDialogsWidthAnimated() {
-	if (!_dialogs || Core::App().settings().dialogsWidthRatio() > 0) {
+	const auto nochat = !_controller->mainSectionShown();
+	if (!_dialogs || Core::App().settings().dialogsWidthRatio(nochat) > 0) {
 		return;
 	}
 	auto dialogsWidth = _dialogsWidth;
 	updateWindowAdaptiveLayout();
-	if (!Core::App().settings().dialogsWidthRatio()
+	if (Core::App().settings().dialogsWidthRatio(nochat) == 0.
 		&& (_dialogsWidth != dialogsWidth
 			|| _a_dialogsWidth.animating())) {
 		_dialogs->startWidthAnimation();
@@ -2537,7 +2620,7 @@ void MainWidget::updateThirdColumnToCurrentChat(
 		if (saveThirdSectionToStackBack()) {
 			_stack.back()->setThirdSectionMemento(
 				_thirdSection->createMemento());
-			_thirdSection.destroy();
+			destroyThirdSection();
 		}
 	};
 	auto &settings = Core::App().settings();
@@ -2583,7 +2666,7 @@ void MainWidget::updateThirdColumnToCurrentChat(
 		settings.setTabbedReplacedWithInfo(false);
 		if (!key) {
 			if (_thirdSection) {
-				_thirdSection.destroy();
+				destroyThirdSection();
 				_thirdShadow.destroy();
 				updateControlsGeometry();
 			}
@@ -2615,31 +2698,41 @@ void MainWidget::returnTabbedSelector() {
 	}
 }
 
+bool MainWidget::relevantForDialogsFocus(not_null<QWidget*> widget) const {
+	if (!_dialogs || widget->window() != window()) {
+		return false;
+	}
+	while (true) {
+		if (widget.get() == this) {
+			return true;
+		}
+		const auto parent = widget->parentWidget();
+		if (!parent) {
+			return false;
+		}
+		widget = parent;
+	}
+	Unexpected("Should never be here.");
+}
+
 bool MainWidget::eventFilter(QObject *o, QEvent *e) {
 	const auto widget = o->isWidgetType()
 		? static_cast<QWidget*>(o)
 		: nullptr;
 	if (e->type() == QEvent::FocusIn) {
-		if (widget && (widget->window() == window())) {
-			if (_history == widget || _history->isAncestorOf(widget)
-				|| (_mainSection
-					&& (_mainSection == widget
-						|| _mainSection->isAncestorOf(widget)))
-				|| (_thirdSection
-					&& (_thirdSection == widget
-						|| _thirdSection->isAncestorOf(widget)))) {
-				_controller->setDialogsListFocused(false);
-			} else if (_dialogs
-				&& (_dialogs == widget
-					|| _dialogs->isAncestorOf(widget))) {
-				_controller->setDialogsListFocused(true);
-			}
+		if (widget && relevantForDialogsFocus(widget)) {
+			_dialogs->updateHasFocus(widget);
+		} else if (widget == window()) {
+			crl::on_main(this, [=] {
+				_controller->widget()->setInnerFocus();
+			});
 		}
 	} else if (e->type() == QEvent::MouseButtonPress) {
 		if (widget && (widget->window() == window())) {
 			const auto event = static_cast<QMouseEvent*>(e);
 			if (event->button() == Qt::BackButton) {
-				if (!Core::App().hideMediaView()) {
+				if (!Core::App().hideMediaView()
+					&& (!_dialogs || !_dialogs->cancelSearchByMouseBack())) {
 					handleHistoryBack();
 				}
 				return true;
@@ -2694,8 +2787,10 @@ void MainWidget::handleHistoryBack() {
 }
 
 void MainWidget::updateWindowAdaptiveLayout() {
+	const auto nochat = !_controller->mainSectionShown();
+
 	auto layout = _controller->computeColumnLayout();
-	auto dialogsWidthRatio = Core::App().settings().dialogsWidthRatio();
+	auto dialogsWidthRatio = Core::App().settings().dialogsWidthRatio(nochat);
 
 	// Check if we are in a single-column layout in a wide enough window
 	// for the normal layout. If so, switch to the normal layout.
@@ -2738,11 +2833,11 @@ void MainWidget::updateWindowAdaptiveLayout() {
 		//}
 	}
 
-	Core::App().settings().setDialogsWidthRatio(dialogsWidthRatio);
+	Core::App().settings().updateDialogsWidthRatio(dialogsWidthRatio, nochat);
 
 	auto useSmallColumnWidth = !isOneColumn()
 		&& !dialogsWidthRatio
-		&& !_controller->forceWideDialogs();
+		&& !_controller->chatsForceDisplayWide();
 	_dialogsWidth = !_dialogs
 		? 0
 		: useSmallColumnWidth

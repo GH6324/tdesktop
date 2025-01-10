@@ -54,33 +54,16 @@ namespace Settings {
 		AddSkip(inner);
 		AddSubsectionTitle(inner, tr::lng_settings_network());
 
-		//auto uploadBoostBtn = AddButtonWithLabel(
-		//		inner,
-		//		tr::lng_settings_net_upload_speed_boost(),
-		//		rpl::single(NetBoostBox::BoostLabel(GetEnhancedInt("net_speed_boost"))),
-		//		st::settingsButtonNoIcon
-		//);
-		//uploadBoostBtn->setColorOverride(QColor(255, 0, 0));
-		//uploadBoostBtn->addClickHandler([=] {
-		//	Ui::show(Box<NetBoostBox>());
-		//});
-
-		auto donwloadBoostBtn = AddButtonWithIcon(
+		auto uploadBoostBtn = AddButtonWithLabel(
 				inner,
-				tr::lng_settings_net_download_speed_boost(),
+				tr::lng_settings_net_upload_speed_boost(),
+				rpl::single(NetBoostBox::BoostLabel(GetEnhancedInt("net_speed_boost"))),
 				st::settingsButtonNoIcon
 		);
-		donwloadBoostBtn->setColorOverride(QColor(255, 0, 0));
-		donwloadBoostBtn->toggleOn(
-				rpl::single(GetEnhancedBool("net_dl_speed_boost"))
-		)->toggledChanges(
-		) | rpl::filter([=](bool toggled) {
-			return (toggled != GetEnhancedBool("net_dl_speed_boost"));
-		}) | rpl::start_with_next([=](bool toggled) {
-			SetEnhancedValue("net_dl_speed_boost", toggled);
-			EnhancedSettings::Write();
-			Core::Restart();
-		}, container->lifetime());
+		uploadBoostBtn->setColorOverride(QColor(255, 0, 0));
+		uploadBoostBtn->addClickHandler([=] {
+			Ui::show(Box<NetBoostBox>());
+		});
 
 		AddSkip(container);
 	}
@@ -499,12 +482,6 @@ namespace Settings {
 		AddSkip(container);
 		AddSubsectionTitle(container, tr::lng_settings_other());
 
-		const auto wrap = container->add(
-				object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
-						container,
-						object_ptr<Ui::VerticalLayout>(container)));
-		const auto inner = wrap->entity();
-
 		auto hideBtn = AddButtonWithIcon(
 			container,
 			tr::lng_settings_hide_all_chats(),
@@ -580,6 +557,29 @@ namespace Settings {
 			SetEnhancedValue("hide_stories", enabled);
 			EnhancedSettings::Write();
 		}, container->lifetime());
+
+		auto value = rpl::single(
+				RecentDisplayLimitController::Label(GetEnhancedInt("recent_display_limit"))
+		) | rpl::then(
+				_BitrateChanged.events()
+		) | rpl::map([=] {
+			return RecentDisplayLimitController::Label(GetEnhancedInt("recent_display_limit"));
+		});
+
+		auto btn = AddButtonWithLabel(
+				container,
+				tr::lng_settings_recent_display_limit(),
+				std::move(value),
+				st::settingsButtonNoIcon
+		);
+		btn->events(
+		) | rpl::start_with_next([=](not_null<QEvent*> e) {
+			const auto event = e->type();
+			if (event == QEvent::UpdateLater) _BitrateChanged.fire({});
+		}, container->lifetime());
+		btn->addClickHandler([=] {
+			Ui::show(Box<RecentDisplayLimitController>());
+		});
 
 		AddSkip(container);
 	}

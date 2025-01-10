@@ -18,11 +18,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "api/api_transcribes.h"
 #include "api/api_who_reacted.h"
 #include "api/api_toggling_media.h" // Api::ToggleFavedSticker
+#include "base/qt/qt_key_modifiers.h"
 #include "base/unixtime.h"
 #include "history/view/history_view_list_widget.h"
 #include "history/view/history_view_cursor_state.h"
 #include "history/history.h"
 #include "history/history_item.h"
+#include "history/history_item_components.h"
 #include "history/history_item_text.h"
 #include "history/history_item_components.h"
 #include "history/view/history_view_schedule_box.h"
@@ -43,7 +45,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/text/text_utilities.h"
 #include "ui/controls/delete_message_context_action.h"
 #include "ui/controls/who_reacted_context_action.h"
-#include "ui/boxes/report_box.h"
+#include "ui/boxes/edit_factcheck_box.h"
+#include "ui/boxes/report_box_graphics.h"
 #include "ui/ui_utility.h"
 #include "menu/menu_item_download_files.h"
 #include "menu/menu_send.h"
@@ -52,10 +55,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/widgets/fields/input_field.h"
 #include "ui/power_saving.h"
 #include "boxes/delete_messages_box.h"
+#include "boxes/moderate_messages_box.h"
 #include "boxes/report_messages_box.h"
 #include "boxes/sticker_set_box.h"
 #include "boxes/stickers_box.h"
 #include "boxes/translate_box.h"
+#include "data/components/factchecks.h"
 #include "data/data_photo.h"
 #include "data/data_photo_media.h"
 #include "data/data_document.h"
@@ -70,7 +75,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_file_click_handler.h"
 #include "data/data_file_origin.h"
 #include "data/data_message_reactions.h"
+#include "data/data_user.h"
 #include "data/stickers/data_custom_emoji.h"
+#include "chat_helpers/message_field.h" // FactcheckFieldIniter.
 #include "core/file_utilities.h"
 #include "core/click_handler_types.h"
 #include "base/platform/base_platform_info.h"
@@ -84,6 +91,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session.h"
 #include "main/main_session_settings.h"
 #include "spellcheck/spellcheck_types.h"
+#include "iv/iv_instance.h" 
 #include "facades.h"
 #include "apiwrap.h"
 #include "styles/style_chat.h"
@@ -98,6 +106,7 @@ namespace {
 
 constexpr auto kRescheduleLimit = 20;
 constexpr auto kTagNameLimit = 12;
+constexpr auto kPublicPostLinkToastDuration = 4 * crl::time(1000);
 
 bool HasEditMessageAction(
 		const ContextMenuRequest &request,
@@ -388,30 +397,16 @@ bool AddForwardSelectedAction(
 	}
 
 	menu->addAction(tr::lng_context_forward_selected(tr::now), [=] {
-		const auto weak = Ui::MakeWeak(list);
-		const auto callback = [=] {
-			if (const auto strong = weak.data()) {
-				strong->cancelSelection();
-			}
-		};
 		Window::ShowNewForwardMessagesBox(
 			request.navigation,
 			ExtractIdsList(request.selectedItems),
-			false,
-			callback);
+			false);
 	}, &st::menuIconForward);
 	menu->addAction(tr::lng_context_forward_selected_no_quote(tr::now), [=] {
-		const auto weak = Ui::MakeWeak(list);
-		const auto callback = [=] {
-			if (const auto strong = weak.data()) {
-				strong->cancelSelection();
-			}
-		};
 		Window::ShowNewForwardMessagesBox(
 				request.navigation,
 				ExtractIdsList(request.selectedItems),
-				true,
-				callback);
+				true);
 	}, &st::menuIconForward);
 	menu->addAction(tr::lng_forward_to_saved_message(tr::now), [=] {
 		const auto weak = Ui::MakeWeak(list);
@@ -427,7 +422,7 @@ bool AddForwardSelectedAction(
 		action.generateLocal = false;
 
 		const auto history = item->history()->peer->owner().history(self);
-		auto resolved = history->resolveForwardDraft(Data::ForwardDraft{ .ids = std::move(items) });
+		auto resolved = history->resolveForwardDraft(Data::ForwardDraft{ .ids = items });
 
 		api->forwardMessages(std::move(resolved), action, [=] {
 			Ui::Toast::Show(tr::lng_share_done(tr::now));
@@ -547,7 +542,7 @@ void AddRepeaterAction(
 					}
 
 					const auto history = item->history()->peer->owner().history(item->history()->peer);
-					auto resolved = history->resolveForwardDraft(Data::ForwardDraft{ .ids = std::move(MessageIdsList(1, itemId)) });
+					auto resolved = history->resolveForwardDraft(Data::ForwardDraft{ .ids = MessageIdsList(1, itemId) });
 
 					api->forwardMessages(std::move(resolved), action, [] {
 						Ui::Toast::Show(tr::lng_share_done(tr::now));
@@ -596,7 +591,7 @@ void AddRepeaterAction(
 						}
 
 						const auto history = item->history()->peer->owner().history(item->history()->peer);
-						auto resolved = history->resolveForwardDraft(Data::ForwardDraft{ .ids = std::move(MessageIdsList(1, itemId)), .options = Data::ForwardOptions::NoSenderNames });
+						auto resolved = history->resolveForwardDraft(Data::ForwardDraft{ .ids = MessageIdsList(1, itemId), .options = Data::ForwardOptions::NoSenderNames });
 
 						api->forwardMessages(std::move(resolved), action, [] {
 							Ui::Toast::Show(tr::lng_share_done(tr::now));
@@ -631,7 +626,7 @@ void AddRepeaterAction(
 					action.generateLocal = false;
 
 					const auto history = item->history()->peer->owner().history(api->session().user()->asUser());
-					auto resolved = history->resolveForwardDraft(Data::ForwardDraft{ .ids = std::move(MessageIdsList( 1, itemId )) });
+					auto resolved = history->resolveForwardDraft(Data::ForwardDraft{ .ids = MessageIdsList(1, itemId) });
 
 					api->forwardMessages(std::move(resolved), action, [] {
 						Ui::Toast::Show(tr::lng_share_done(tr::now));
@@ -736,7 +731,7 @@ bool AddRescheduleAction(
 	const auto owner = &request.navigation->session().data();
 
 	const auto goodSingle = HasEditMessageAction(request, list)
-		&& request.item->isScheduled();
+		&& request.item->allowsReschedule();
 	const auto goodMany = [&] {
 		if (goodSingle) {
 			return false;
@@ -748,7 +743,7 @@ bool AddRescheduleAction(
 		if (items.size() > kRescheduleLimit) {
 			return false;
 		}
-		return ranges::all_of(items, &SelectedItem::canSendNow);
+		return ranges::all_of(items, &SelectedItem::canReschedule);
 	}();
 	if (!goodSingle && !goodMany) {
 		return false;
@@ -773,10 +768,17 @@ bool AddRescheduleAction(
 		}
 		const auto callback = [=](Api::SendOptions options) {
 			list->cancelSelection();
+			auto groupedIds = std::vector<MessageGroupId>();
 			for (const auto &id : ids) {
 				const auto item = owner->message(id);
 				if (!item || !item->isScheduled()) {
 					continue;
+				}
+				if (const auto groupId = item->groupId()) {
+					if (ranges::contains(groupedIds, groupId)) {
+						continue;
+					}
+					groupedIds.push_back(groupId);
 				}
 				Api::RescheduleMessage(item, options);
 				// Increase the scheduled date by 1s to keep the order.
@@ -796,13 +798,15 @@ bool AddRescheduleAction(
 		const auto itemDate = firstItem->date();
 		const auto date = (itemDate == Api::kScheduledUntilOnlineTimestamp)
 			? HistoryView::DefaultScheduleTime()
-			: itemDate + 600;
+			: itemDate + (firstItem->isScheduled() ? 0 : crl::time(600));
 
 		const auto box = request.navigation->parentController()->show(
 			HistoryView::PrepareScheduleBox(
 				&request.navigation->session(),
-				sendMenuType,
+				request.navigation->uiShow(),
+				{ .type = sendMenuType, .effectAllowed = false },
 				callback,
+				{}, // initial options
 				date));
 
 		owner->itemRemoved(
@@ -839,21 +843,17 @@ bool AddReplyToMessageAction(
 	}
 
 	const auto &quote = request.quote;
-	auto text = quote.text.empty()
-		? tr::lng_context_reply_msg(tr::now)
-		: tr::lng_context_quote_and_reply(tr::now);
-	text.replace('&', u"&&"_q);
-	const auto itemId = item->fullId();
-	menu->addAction(text, [=] {
-		if (!item) {
-			return;
-		} else {
-			list->replyToMessageRequestNotify({
-				.messageId = itemId,
-				.quote = quote.text,
-				.quoteOffset = quote.offset,
-			});
-		}
+	auto text = (quote.text.empty()
+		? tr::lng_context_reply_msg
+		: tr::lng_context_quote_and_reply)(
+			tr::now,
+			Ui::Text::FixAmpersandInAction);
+	menu->addAction(std::move(text), [=, itemId = item->fullId()] {
+		list->replyToMessageRequestNotify({
+			.messageId = itemId,
+			.quote = quote.text,
+			.quoteOffset = quote.offset,
+		}, base::IsCtrlPressed());
 	}, &st::menuIconReply);
 	return true;
 }
@@ -925,6 +925,31 @@ bool AddEditMessageAction(
 		list->editMessageRequestNotify(item->fullId());
 	}, &st::menuIconEdit);
 	return true;
+}
+
+void AddFactcheckAction(
+		not_null<Ui::PopupMenu*> menu,
+		const ContextMenuRequest &request,
+		not_null<ListWidget*> list) {
+	const auto item = request.item;
+	if (!item || !item->history()->session().factchecks().canEdit(item)) {
+		return;
+	}
+	const auto itemId = item->fullId();
+	const auto text = item->factcheckText();
+	const auto session = &item->history()->session();
+	const auto phrase = text.empty()
+		? tr::lng_context_add_factcheck(tr::now)
+		: tr::lng_context_edit_factcheck(tr::now);
+	menu->addAction(phrase, [=] {
+		const auto limit = session->factchecks().lengthLimit();
+		const auto controller = request.navigation->parentController();
+		controller->show(Box(EditFactcheckBox, text, limit, [=](
+				TextWithEntities result) {
+			const auto show = controller->uiShow();
+			session->factchecks().save(itemId, text, result, show);
+		}, FactcheckFieldIniter(controller->uiShow())));
+	}, &st::menuIconFactcheck);
 }
 
 bool AddPinMessageAction(
@@ -1049,9 +1074,15 @@ bool AddDeleteMessageAction(
 				controller->cancelUploadLayer(item);
 				return;
 			}
-			const auto suggestModerateActions = true;
-			controller->show(
-				Box<DeleteMessagesBox>(item, suggestModerateActions));
+			const auto list = HistoryItemsList{ item };
+			if (CanCreateModerateMessagesBox(list)) {
+				controller->show(
+					Box(CreateModerateMessagesBox, list, nullptr));
+			} else {
+				const auto suggestModerateActions = false;
+				controller->show(
+					Box<DeleteMessagesBox>(item, suggestModerateActions));
+			}
 		}
 	});
 	if (item->isUploading()) {
@@ -1110,11 +1141,15 @@ void AddReportAction(
 	const auto callback = crl::guard(controller, [=] {
 		if (const auto item = owner->message(itemId)) {
 			const auto group = owner->groups().find(item);
-			controller->show(ReportItemsBox(
-				item->history()->peer,
-				(group
-					? owner->itemsToIds(group->items)
-					: MessageIdsList{ 1, itemId })));
+			const auto ids = group
+				? (ranges::views::all(
+					group->items
+				) | ranges::views::transform([](const auto &i) {
+					return i->fullId().msg;
+				}) | ranges::to_vector)
+				: std::vector<MsgId>{ 1, itemId.msg };
+			const auto peer = item->history()->peer;
+			ShowReportMessageBox(controller->uiShow(), peer, ids, {});
 		}
 	});
 	menu->addAction(
@@ -1180,6 +1215,7 @@ void AddTopMessageActions(
 	AddGoToMessageAction(menu, request, list);
 	AddViewRepliesAction(menu, request, list);
 	AddEditMessageAction(menu, request, list);
+	AddFactcheckAction(menu, request, list);
 	AddPinMessageAction(menu, request, list);
 }
 
@@ -1250,7 +1286,7 @@ void EditTagBox(
 			customId,
 			[=] { field->update(); });
 	} else {
-		owner->reactions().preloadImageFor(id);
+		owner->reactions().preloadReactionImageFor(id);
 	}
 	field->paintRequest() | rpl::start_with_next([=](QRect clip) {
 		auto p = QPainter(field);
@@ -1265,9 +1301,8 @@ void EditTagBox(
 			});
 		} else {
 			if (state->image.isNull()) {
-				state->image = owner->reactions().resolveImageFor(
-					id,
-					::Data::Reactions::ImageSize::InlineList);
+				state->image = owner->reactions().resolveReactionImageFor(
+					id);
 			}
 			if (!state->image.isNull()) {
 				const auto size = st::reactionInlineSize;
@@ -1277,7 +1312,7 @@ void EditTagBox(
 		}
 	}, field->lifetime());
 
-	AddLengthLimitLabel(field, kTagNameLimit);
+	Ui::AddLengthLimitLabel(field, kTagNameLimit);
 
 	const auto save = [=] {
 		const auto text = field->getLastText();
@@ -1449,12 +1484,17 @@ base::unique_qptr<Ui::PopupMenu> FillContextMenu(
 	AddCopyLinkAction(result, link);
 	AddMessageActions(result, request, list);
 
-	if (item) {
+	const auto wasAmount = result->actions().size();
+	if (const auto textItem = view ? view->textItem() : item) {
 		AddEmojiPacksAction(
 			result,
-			item,
+			textItem,
 			HistoryView::EmojiPacksSource::Message,
 			list->controller());
+	}
+	if (item) {
+		const auto added = (result->actions().size() > wasAmount);
+		AddSelectRestrictionAction(result, item, !added);
 	}
 
 	return result;
@@ -1464,17 +1504,29 @@ void CopyPostLink(
 		not_null<Window::SessionController*> controller,
 		FullMsgId itemId,
 		Context context) {
-	const auto item = controller->session().data().message(itemId);
+	CopyPostLink(controller->uiShow(), itemId, context);
+}
+
+void CopyPostLink(
+		std::shared_ptr<Main::SessionShow> show,
+		FullMsgId itemId,
+		Context context) {
+	const auto item = show->session().data().message(itemId);
 	if (!item || !item->hasDirectLink()) {
 		return;
 	}
 	const auto inRepliesContext = (context == Context::Replies);
+	const auto forceNonPublicLink = base::IsCtrlPressed();
 	QGuiApplication::clipboard()->setText(
 		item->history()->session().api().exportDirectMessageLink(
 			item,
-			inRepliesContext));
+			inRepliesContext,
+			forceNonPublicLink));
 
 	const auto isPublicLink = [&] {
+		if (forceNonPublicLink) {
+			return false;
+		}
 		const auto channel = item->history()->peer->asChannel();
 		Assert(channel != nullptr);
 		if (const auto rootId = item->replyToTop()) {
@@ -1490,10 +1542,42 @@ void CopyPostLink(
 		}
 		return channel->hasUsername();
 	}();
+	if (isPublicLink) {
+		show->showToast({
+			.text = tr::lng_channel_public_link_copied(
+				tr::now, Ui::Text::Bold
+			).append('\n').append(Platform::IsMac()
+				? tr::lng_public_post_private_hint_cmd(tr::now)
+				: tr::lng_public_post_private_hint_ctrl(tr::now)),
+			.duration = kPublicPostLinkToastDuration,
+		});
+	} else {
+		show->showToast(isPublicLink
+			? tr::lng_channel_public_link_copied(tr::now)
+			: tr::lng_context_about_private_link(tr::now));
+	}
+}
 
-	controller->showToast(isPublicLink
-		? tr::lng_channel_public_link_copied(tr::now)
-		: tr::lng_context_about_private_link(tr::now));
+void ViewAsJSON(
+	not_null<Window::SessionController*> controller,
+	FullMsgId itemId) {
+	ViewAsJSON(controller->uiShow(), itemId);
+}
+
+void ViewAsJSON(
+	std::shared_ptr<Main::SessionShow> show,
+	FullMsgId itemId) {
+	const auto item = show->session().data().message(itemId);
+	if (!item) {
+		return;
+	}
+	item->history()->session().api().exportMessageAsBase64(item,
+		crl::guard(show, [=](const QString& base64) {
+			Core::App().iv().showTLViewer(MTP::details::kCurrentLayer, base64);
+		}),
+		crl::guard(show, [=] {
+			show->showToast(u"error"_q);
+		}));
 }
 
 void CopyStoryLink(
@@ -1521,15 +1605,15 @@ void AddPollActions(
 		const auto radio = QString::fromUtf8(kRadio);
 		auto text = poll->question;
 		for (const auto &answer : poll->answers) {
-			text += '\n' + radio + answer.text;
+			text.append('\n').append(radio).append(answer.text);
 		}
-		if (!Ui::SkipTranslate({ text })) {
+		if (!Ui::SkipTranslate(text)) {
 			menu->addAction(tr::lng_context_translate(tr::now), [=] {
 				controller->show(Box(
 					Ui::TranslateBox,
 					item->history()->peer,
 					MsgId(),
-					TextWithEntities{ .text = text },
+					std::move(text),
 					item->forbidsForward()));
 			}, &st::menuIconTranslate);
 		}
@@ -1603,6 +1687,31 @@ void AddSaveSoundForNotifications(
 	}, &st::menuIconSoundAdd);
 }
 
+void AddWhenEditedForwardedActionHelper(
+		not_null<Ui::PopupMenu*> menu,
+		not_null<HistoryItem*> item,
+		bool insertSeparator) {
+	if (const auto forwarded = item->Get<HistoryMessageForwarded>()) {
+		if (!forwarded->story && forwarded->psaType.isEmpty()) {
+			if (insertSeparator && !menu->empty()) {
+				menu->addSeparator(&st::expandedMenuSeparator);
+			}
+			menu->addAction(Ui::WhenReadContextAction(
+				menu.get(),
+				Api::WhenOriginal(item->from(), forwarded->originalDate)));
+		}
+	} else if (const auto edited = item->Get<HistoryMessageEdited>()) {
+		if (!item->hideEditedBadge()) {
+			if (insertSeparator && !menu->empty()) {
+				menu->addSeparator(&st::expandedMenuSeparator);
+			}
+			menu->addAction(Ui::WhenReadContextAction(
+				menu.get(),
+				Api::WhenEdited(item->from(), edited->date)));
+		}
+	}
+}
+
 void AddWhoReactedAction(
 		not_null<Ui::PopupMenu*> menu,
 		not_null<QWidget*> context,
@@ -1638,14 +1747,17 @@ void AddWhoReactedAction(
 			strong->hideMenu();
 		}
 		if (const auto item = controller->session().data().message(itemId)) {
-			controller->window().show(Reactions::FullListBox(
-				controller,
-				item,
-				{},
-				whoReadIds));
+			controller->showSection(
+				std::make_shared<Info::Memento>(
+					whoReadIds,
+					itemId,
+					HistoryView::Reactions::DefaultSelectedTab(
+						item,
+						whoReadIds)));
 		}
 	};
 	if (item->history()->peer->isUser()) {
+		AddWhenEditedForwardedActionHelper(menu, item, false);
 		menu->addAction(Ui::WhenReadContextAction(
 			menu.get(),
 			Api::WhoReacted(item, context, st::defaultWhoRead, whoReadIds),
@@ -1657,10 +1769,14 @@ void AddWhoReactedAction(
 			Data::ReactedMenuFactory(&controller->session()),
 			participantChosen,
 			showAllChosen));
-	if (!menu->empty()) {
-		menu->addSeparator();
+		AddWhenEditedForwardedActionHelper(menu, item, true);
 	}
-	}
+}
+
+void MaybeAddWhenEditedForwardedAction(
+		not_null<Ui::PopupMenu*> menu,
+		not_null<HistoryItem*> item) {
+	AddWhenEditedForwardedActionHelper(menu, item, true);
 }
 
 void AddEditTagAction(
@@ -1722,9 +1838,7 @@ void ShowTagMenu(
 		if (const auto item = owner->message(itemId)) {
 			const auto &list = item->reactions();
 			if (ranges::contains(list, id, &MessageReaction::id)) {
-				item->toggleReaction(
-					id,
-					HistoryItem::ReactionSource::Quick);
+				item->toggleReaction(id, HistoryReactionSource::Quick);
 			}
 		}
 	};
@@ -1808,17 +1922,18 @@ void ShowWhoReactedMenu(
 	};
 	const auto showAllChosen = [=, itemId = item->fullId()]{
 		if (const auto item = controller->session().data().message(itemId)) {
-			controller->window().show(Reactions::FullListBox(
-				controller,
-				item,
-				id));
+			controller->showSection(std::make_shared<Info::Memento>(
+				nullptr,
+				itemId,
+				HistoryView::Reactions::DefaultSelectedTab(item, id)));
 		}
 	};
 	const auto owner = &controller->session().data();
 	const auto reactions = &owner->reactions();
 	const auto &list = reactions->list(
 		Data::Reactions::Type::Active);
-	const auto activeNonQuick = (id != reactions->favoriteId())
+	const auto activeNonQuick = !id.paid()
+		&& (id != reactions->favoriteId())
 		&& (ranges::contains(list, id, &Data::Reaction::id)
 			|| (controller->session().premium() && id.custom()));
 	const auto filler = lifetime.make_state<Ui::WhoReactedListMenu>(
@@ -2011,6 +2126,39 @@ void AddEmojiPacksAction(
 		controller);
 }
 
+void AddSelectRestrictionAction(
+		not_null<Ui::PopupMenu*> menu,
+		not_null<HistoryItem*> item,
+		bool addIcon) {
+	const auto peer = item->history()->peer;
+	if ((peer->allowsForwarding() && !item->forbidsForward())
+		|| item->isSponsored()) {
+		return;
+	}
+	if (addIcon && !menu->empty()) {
+		menu->addSeparator();
+	}
+	auto button = base::make_unique_q<Ui::Menu::MultilineAction>(
+		menu->menu(),
+		menu->st().menu,
+		st::historyHasCustomEmoji,
+		addIcon
+			? st::historySponsoredAboutMenuLabelPosition
+			: st::historyHasCustomEmojiPosition,
+		(peer->isMegagroup()
+			? tr::lng_context_noforwards_info_group
+			: (peer->isChannel())
+			? tr::lng_context_noforwards_info_channel
+			: (peer->isUser() && peer->asUser()->isBot())
+			? tr::lng_context_noforwards_info_channel
+			: tr::lng_context_noforwards_info_bot)(
+			tr::now,
+			Ui::Text::RichLangValue),
+		addIcon ? &st::menuIconCopyright : nullptr);
+	button->setAttribute(Qt::WA_TransparentForMouseEvents);
+	menu->addAction(std::move(button));
+}
+
 TextWithEntities TransribedText(not_null<HistoryItem*> item) {
 	const auto media = item->media();
 	const auto document = media ? media->document() : nullptr;
@@ -2033,42 +2181,6 @@ bool ItemHasTtl(HistoryItem *item) {
 	return (item && item->media())
 		? (item->media()->ttlSeconds() > 0)
 		: false;
-}
-
-void AddLengthLimitLabel(not_null<Ui::InputField*> field, int limit) {
-	struct State {
-		rpl::variable<int> length;
-	};
-	const auto state = field->lifetime().make_state<State>();
-	state->length = rpl::single(
-		rpl::empty
-	) | rpl::then(field->changes()) | rpl::map([=] {
-		return int(field->getLastText().size());
-	});
-	auto warningText = state->length.value() | rpl::map([=](int count) {
-		const auto threshold = std::min(limit / 2, 9);
-		const auto left = limit - count;
-		return (left < threshold) ? QString::number(left) : QString();
-	});
-	const auto warning = Ui::CreateChild<Ui::FlatLabel>(
-		field.get(),
-		std::move(warningText),
-		st::editTagLimit);
-	state->length.value() | rpl::map(
-		rpl::mappers::_1 > limit
-	) | rpl::start_with_next([=](bool exceeded) {
-		warning->setTextColorOverride(exceeded
-			? st::attentionButtonFg->c
-			: std::optional<QColor>());
-	}, warning->lifetime());
-	rpl::combine(
-		field->sizeValue(),
-		warning->sizeValue()
-	) | rpl::start_with_next([=] {
-		warning->moveToRight(0, 0);
-	}, warning->lifetime());
-	warning->setAttribute(Qt::WA_TransparentForMouseEvents);
-
 }
 
 } // namespace HistoryView

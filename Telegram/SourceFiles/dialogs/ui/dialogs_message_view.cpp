@@ -274,6 +274,9 @@ void MessageView::paint(
 	if (geometry.isEmpty()) {
 		return;
 	}
+	if (GetEnhancedBool("screenshot_mode")) {
+		return;
+	}
 	p.setFont(st::dialogsTextFont);
 	p.setPen(context.active
 		? st::dialogsTextFgActive
@@ -445,12 +448,13 @@ HistoryView::ItemPreview PreviewWithSender(
 		HistoryView::ItemPreview &&preview,
 		const QString &sender,
 		TextWithEntities topic) {
+	const auto wrappedSender = st::wrap_rtl(sender);
 	auto senderWithOffset = topic.empty()
-		? TextWithTagOffset<lt_from>::FromString(sender)
+		? TextWithTagOffset<lt_from>::FromString(wrappedSender)
 		: tr::lng_dialogs_text_from_in_topic(
 			tr::now,
 			lt_from,
-			{ sender },
+			{ wrappedSender },
 			lt_topic,
 			std::move(topic),
 			TextWithTagOffset<lt_from>::FromString);
